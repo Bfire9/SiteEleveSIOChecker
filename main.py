@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 """Portail SIO1 - serveur + interface, compatible Render.
 
+Un seul fichier, deux rôles :
+
+  1) Sur un PC/serveur DU RÉSEAU BTS SIO  -> il analyse les sites et
+     envoie les résultats au portail en ligne (PUSH_URL + SYNC_KEY).
+  2) Sur Render (hors réseau)             -> il affiche les résultats
+     synchronisés à tous les visiteurs (aucune installation côté visiteur).
+
 Local :
     python3 portail.py
     http://localhost:8000
@@ -15,6 +22,7 @@ Render :
 import json
 import os
 import re
+import socket
 import sqlite3
 import threading
 import time
@@ -37,6 +45,11 @@ SIO1_DOMAIN = os.environ.get("SIO1_DOMAIN", "sio1.lab").strip().lower()
 
 DB_FILE = os.environ.get("DB_FILE", "sio1.db")
 
+# Synchronisation entre l'instance du réseau BTS SIO et l'instance en ligne
+SYNC_KEY = os.environ.get("SYNC_KEY", "")        # secret commun (obligatoire pour sync)
+PUSH_URL = os.environ.get("PUSH_URL", "").strip()  # ex: https://mon-portail.onrender.com
+PROBE = os.environ.get("SIO1_PROBE", SIO1_DOMAIN).strip().lower()  # hôte testé pour détecter le réseau
+
 TIMEOUT = 10
 MAX_BYTES = 3_000_000
 MAX_BODY = 2_000_000
@@ -47,12 +60,7 @@ DB_LOCK = threading.Lock()
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 PATH_RE = re.compile(r"^/(?!/)[^\s\\]*$")
 
-SEED = (
-    "auguste lecanu salavin bailly soeiro taranne genet lhuillier "
-    "amaral sousa ghattas corbier sergent riaublanc bensalem gilles "
-    "wasikowski champagne disashi bourgeois neveu khaldi poul rome "
-    "kanat beaur loussouarn"
-).split()
+SEED = []  # aucun nom en dur
 
 
 # ============================================================
@@ -120,6 +128,47 @@ def site_host(user):
 
 def site_url(user, path="/"):
     return f"http://{site_host(user)}{path}"
+
+
+_lan_cache = [0.0, False]
+
+
+def on_lan():
+    """True si CE serveur peut atteindre le réseau du BTS SIO."""
+    if time.time() - _lan_cache[0] > 20:
+        try:
+            socket.create_connection((PROBE, 80), 2).close()
+            _lan_cache[1] = True
+        except OSError:
+            _lan_cache[1] = False
+        _lan_cache[0] = time.time()
+    return _lan_cache[1]
+
+
+def push_remote(act, data):
+    """Envoie une écriture vers le portail en ligne (en arrière-plan)."""
+    def run():
+        try:
+            body = json.dumps({"act": act, "data": data}).encode()
+            req = urllib.request.Request(
+                PUSH_URL.rstrip("/") + "/api/sync",
+                data=body,
+                headers={"Content-Type": "application/json",
+                         "X-Sync-Key": SYNC_KEY},
+            )
+            urllib.request.urlopen(req, timeout=60).read()
+        except Exception as e:
+            print("PUSH ERROR:", e)
+    threading.Thread(target=run, daemon=True).start()
+
+
+def initial_push():
+    with DB_LOCK, db() as c:
+        users = [r[0] for r in c.execute("SELECT name FROM users ORDER BY rowid")]
+        sites = [json.loads(r[0]) for r in c.execute("SELECT data FROM sites")]
+    push_remote("/api/users", users)
+    for st in sites:
+        push_remote("/api/site", st)
 
 
 # ============================================================
@@ -242,6 +291,13 @@ class Handler(BaseHTTPRequestHandler):
         # FETCH
         # ----------------------------------------------------
 
+        if url.path == "/api/lan":
+            return self.send(
+                200,
+                json.dumps({"lan": on_lan()}).encode(),
+                "application/json"
+            )
+
         if url.path == "/fetch":
             q = parse_qs(url.query)
 
@@ -357,6 +413,15 @@ class Handler(BaseHTTPRequestHandler):
             )
 
         act = urlparse(self.path).path
+        synced = False
+
+        if act == "/api/sync":
+            if not SYNC_KEY or self.headers.get("X-Sync-Key") != SYNC_KEY:
+                return self.send(403, b"Cle invalide")
+            if not isinstance(data, dict):
+                return self.send(400, b"JSON invalide")
+            act, data = data.get("act", ""), data.get("data")
+            synced = True
 
         try:
             with DB_LOCK, db() as c:
@@ -428,6 +493,9 @@ class Handler(BaseHTTPRequestHandler):
                     )
 
                 c.commit()
+
+                if PUSH_URL and not synced:
+                    push_remote(act, data)
 
             return self.send(
                 200,
@@ -1264,7 +1332,7 @@ td a.name{
 
 <div class="header-right">
     <span class="online"></span>
-    Environnement en ligne
+    <span id="netState">Vérification…</span>
 </div>
 
 </header>
@@ -1663,6 +1731,25 @@ const strip = s =>
         .toLowerCase();
 
 
+const siteHost = u => `${u}.${DOMAIN}`;
+
+let lanOK = false;
+
+async function detectLan() {
+    const j = await api("/api/lan");
+    lanOK = !!(j && j.lan);
+    $("netState").textContent = lanOK
+        ? "Serveur sur le réseau BTS SIO — analyse active"
+        : "Mode consultation — données synchronisées";
+    $("allBtn").style.display = lanOK ? "" : "none";
+    document.querySelectorAll(".opts, .progress").forEach(
+        e => e.style.display = lanOK ? "" : "none"
+    );
+}
+
+detectLan();
+setInterval(detectLan, 20000);
+
 let users = [];
 let rows = {};
 let history = [];
@@ -1785,7 +1872,7 @@ function renderUsers() {
 
             stopFlag = false;
 
-            scanUser(u,true);
+            lanOK ? scanUser(u,true) : showFiche(u);
 
         };
 
@@ -4584,6 +4671,9 @@ HTML = HTML.replace(
 if __name__ == "__main__":
 
     init_db()
+
+    if PUSH_URL:
+        initial_push()
 
     try:
 
